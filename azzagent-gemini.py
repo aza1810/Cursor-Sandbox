@@ -1,6 +1,6 @@
 #!/usr/local/bin/python3.9
 """
-AzzAgent Gemini 1.6
+AzzAgent Gemini 1.7
 Tiny 32-bit-friendly coding/system agent for Python 3.9.
 
 Features:
@@ -9,10 +9,13 @@ Features:
 - Project AND system approval prompts default to YES when left blank.
 - Shell/system-shell output streams live while commands run.
 - Clear status for Sent, Thinking, Received, Tool, Command, Recover and Reply.
+- Up/Down arrows cycle through previously sent commands, persisted across restarts.
 - /model lists all generateContent models available to the API key.
 - Last successfully used model is remembered across restarts.
 - Malformed Gemini tool JSON is automatically repaired and retried.
 - Tool/command failures are fed back to Gemini so it can diagnose and fix them.
+- Recursive AzzAgent launches are blocked so the agent cannot accidentally start
+  a second interactive copy of itself and appear to hang.
 """
 
 import json
@@ -20,6 +23,7 @@ import os
 from pathlib import Path
 import re
 import select
+import shlex
 import socket
 import subprocess
 import sys
@@ -27,6 +31,11 @@ import threading
 import time
 import urllib.error
 import urllib.request
+
+try:
+    import readline
+except ImportError:
+    readline = None
 
 DEFAULT_MODEL = "gemini-3.6-flash"
 MODEL = DEFAULT_MODEL
@@ -36,10 +45,12 @@ MAX_TOOL_STEPS = 16
 MAX_PROTOCOL_REPAIRS = 3
 MAX_OUTPUT_CHARS = 30000
 HISTORY = []
+COMMAND_HISTORY = []
 API_KEY = None
 
 KEY_FILE = Path.home() / ".azzagent_gemini_key"
 MODEL_FILE = Path.home() / ".azzagent_model"
+INPUT_HISTORY_FILE = Path.home() / ".azzagent_history"
 TRANSIENT_HTTP_CODES = (429, 500, 502, 503, 504)
 
 PRIMARY_TIMEOUT = 25
@@ -48,6 +59,7 @@ MODEL_LIST_TIMEOUT = 20
 COMMAND_TIMEOUT = 120
 HEARTBEAT_SECONDS = 3
 COMMAND_HEARTBEAT_SECONDS = 5
+MAX_INPUT_HISTORY = 200
 
 
 class GeminiHTTPError(Exception):
@@ -102,6 +114,146 @@ def save_model(model):
             pass
     except Exception as e:
         print("[Warning] Could not save model preference: %s" % e)
+
+
+def setup_command_history():
+    global COMMAND_HISTORY
+    try:
+        if INPUT_HISTORY_FILE.exists():
+            data = json.loads(INPUT_HISTORY_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                COMMAND_HISTORY = [str(x) for x in data if str(x).strip()][-MAX_INPUT_HISTORY:]
+    except Exception:
+        COMMAND_HISTORY = []
+
+    if readline is not None:
+        try:
+            readline.clear_history()
+            for item in COMMAND_HISTORY:
+                readline.add_history(item)
+            readline.set_history_length(MAX_INPUT_HISTORY)
+            readline.parse_and_bind("set editing-mode emacs")
+            readline.parse_and_bind('"\\e[A": previous-history')
+            readline.parse_and_bind('"\\e[B": next-history')
+        except Exception:
+            pass
+
+
+def remember_command(text):
+    text = text.strip()
+    if not text:
+        return
+    if not COMMAND_HISTORY or COMMAND_HISTORY[-1] != text:
+        COMMAND_HISTORY.append(text)
+        del COMMAND_HISTORY[:-MAX_INPUT_HISTORY]
+
+    if readline is not None:
+        try:
+            count = readline.get_current_history_length()
+            last = readline.get_history_item(count) if count else None
+            if last != text:
+                readline.add_history(text)
+        except Exception:
+            pass
+
+    try:
+        INPUT_HISTORY_FILE.write_text(json.dumps(COMMAND_HISTORY[-MAX_INPUT_HISTORY:]), encoding="utf-8")
+        try:
+            os.chmod(str(INPUT_HISTORY_FILE), 0o600)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _redraw_fallback_input(prompt, text, old_len):
+    sys.stdout.write("\r" + prompt + text)
+    if old_len > len(text):
+        sys.stdout.write(" " * (old_len - len(text)))
+        sys.stdout.write("\b" * (old_len - len(text)))
+    sys.stdout.flush()
+
+
+def _fallback_history_input(prompt):
+    """Minimal Tiny Core line editor used only if Python lacks GNU readline."""
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        return input(prompt)
+
+    try:
+        import termios
+        import tty
+    except ImportError:
+        return input(prompt)
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    text = ""
+    draft = ""
+    index = len(COMMAND_HISTORY)
+    old_len = 0
+
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    try:
+        tty.setraw(fd)
+        while True:
+            ch = os.read(fd, 1)
+            if not ch:
+                raise EOFError
+
+            if ch in (b"\r", b"\n"):
+                sys.stdout.write("\r\n")
+                sys.stdout.flush()
+                return text
+            if ch == b"\x03":
+                sys.stdout.write("^C\r\n")
+                sys.stdout.flush()
+                raise KeyboardInterrupt
+            if ch == b"\x04" and not text:
+                raise EOFError
+            if ch in (b"\x7f", b"\x08"):
+                if text:
+                    old_len = len(text)
+                    text = text[:-1]
+                    _redraw_fallback_input(prompt, text, old_len)
+                continue
+
+            if ch == b"\x1b":
+                seq = os.read(fd, 2)
+                if seq == b"[A" and COMMAND_HISTORY:
+                    if index == len(COMMAND_HISTORY):
+                        draft = text
+                    index = max(0, index - 1)
+                    old_len = len(text)
+                    text = COMMAND_HISTORY[index]
+                    _redraw_fallback_input(prompt, text, old_len)
+                elif seq == b"[B" and COMMAND_HISTORY:
+                    old_len = len(text)
+                    if index < len(COMMAND_HISTORY) - 1:
+                        index += 1
+                        text = COMMAND_HISTORY[index]
+                    else:
+                        index = len(COMMAND_HISTORY)
+                        text = draft
+                    _redraw_fallback_input(prompt, text, old_len)
+                continue
+
+            try:
+                char = ch.decode("utf-8")
+            except Exception:
+                continue
+            if char.isprintable():
+                text += char
+                sys.stdout.write(char)
+                sys.stdout.flush()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+def command_input(prompt="You> "):
+    if readline is not None:
+        return input(prompt)
+    return _fallback_history_input(prompt)
 
 
 def resolve_read_path(value):
@@ -241,7 +393,40 @@ def _terminate_process(proc):
         pass
 
 
+def _looks_like_recursive_agent_launch(command):
+    """Block `python azzagent.py` inside AzzAgent, but allow py_compile."""
+    names = {Path(__file__).name.lower(), "azzagent.py", "azzagent-gemini.py"}
+    try:
+        segments = re.split(r"(?:&&|\|\||;|\|)", command)
+        for segment in segments:
+            try:
+                tokens = shlex.split(segment)
+            except Exception:
+                continue
+            if not tokens:
+                continue
+            exe = os.path.basename(tokens[0]).lower()
+            if not re.match(r"^python(?:3(?:\.\d+)?)?$", exe):
+                continue
+            if len(tokens) >= 3 and tokens[1] == "-m" and tokens[2] == "py_compile":
+                continue
+            for token in tokens[1:]:
+                if os.path.basename(token).lower() in names:
+                    return True
+    except Exception:
+        pass
+    return False
+
+
 def _run_shell(command, cwd, approval_message, system=False):
+    if _looks_like_recursive_agent_launch(command):
+        print("[Blocked] Recursive AzzAgent launch prevented")
+        return (
+            "ERROR: recursive AzzAgent launch blocked. Do not execute azzagent.py from inside AzzAgent. "
+            "Use read_file to inspect it, replace_text/write_file to edit it, or "
+            "python3.9 -m py_compile azzagent.py to syntax-check it."
+        )
+
     approve = system_approve if system else normal_approve
     if not approve(approval_message):
         return "DENIED"
@@ -261,6 +446,7 @@ def _run_shell(command, cwd, approval_message, system=False):
             command,
             cwd=str(cwd),
             shell=True,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             bufsize=0,
@@ -375,6 +561,11 @@ For changes outside the project root, use system_write_file/system_replace_text 
 Both project and system approval prompts default to YES when the user presses Enter.
 Shell command output is streamed live to the user.
 
+IMPORTANT SHELL BEHAVIOUR:
+- Shell commands must be non-interactive. Do not start programs that wait for keyboard input.
+- NEVER execute azzagent.py or azzagent-gemini.py with Python from inside AzzAgent. It starts another interactive copy and causes an apparent hang.
+- Inspect AzzAgent with read_file, edit it with replace_text/write_file, and syntax-check with `python3.9 -m py_compile azzagent.py`.
+
 IMPORTANT ERROR BEHAVIOUR:
 - When a tool or command returns ERROR or a non-zero exit code, read the complete result, diagnose it, and try a sensible corrective action automatically.
 - Do not stop at the first failed command unless user input is genuinely required or no safe route remains.
@@ -410,7 +601,7 @@ def _raw_model_request(model, prompt, timeout_seconds):
         headers={
             "Content-Type": "application/json",
             "x-goog-api-key": API_KEY,
-            "User-Agent": "AzzAgent-Gemini/1.6",
+            "User-Agent": "AzzAgent-Gemini/1.7",
         },
         method="POST",
     )
@@ -466,7 +657,7 @@ def available_models():
     url = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000"
     request = urllib.request.Request(
         url,
-        headers={"x-goog-api-key": API_KEY, "User-Agent": "AzzAgent-Gemini/1.6"},
+        headers={"x-goog-api-key": API_KEY, "User-Agent": "AzzAgent-Gemini/1.7"},
         method="GET",
     )
     try:
@@ -722,14 +913,16 @@ def show_models():
 def main():
     global MODEL, AUTO_APPROVE, API_KEY
     MODEL = load_saved_model()
+    setup_command_history()
 
-    print("AzzAgent Gemini 1.6")
+    print("AzzAgent Gemini 1.7")
     print("Project root: %s" % PROJECT_ROOT)
     print("System read: /")
     print("Model: %s" % MODEL)
     print("Project approval default: YES")
     print("System approval default: YES")
     print("Command output: LIVE")
+    print("Command history: UP/DOWN arrows (%d saved)" % len(COMMAND_HISTORY))
     print("Error recovery: ON")
     print("Protocol self-repair: ON (%d retries)" % MAX_PROTOCOL_REPAIRS)
     print("Primary timeout: %ss | fallback: %ss | command: %ss" % (
@@ -743,12 +936,16 @@ def main():
 
     while True:
         try:
-            user_text = input("\nYou> ").strip()
+            print()
+            user_text = command_input("You> ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
         if not user_text:
             continue
+
+        remember_command(user_text)
+
         if user_text in ("/quit", "/exit", "quit", "exit"):
             break
         if user_text in ("/model", "/models"):
