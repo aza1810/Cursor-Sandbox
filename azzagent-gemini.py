@@ -1,6 +1,6 @@
 #!/usr/local/bin/python3.9
 """
-AzzAgent Gemini 1.2
+AzzAgent Gemini 1.3
 32-bit-friendly coding/system agent for Python 3.9.
 
 - Reads may inspect the whole Linux filesystem.
@@ -11,12 +11,14 @@ AzzAgent Gemini 1.2
 - /model lists every generateContent model available to the current API key.
 - The last successfully selected/used model is remembered across restarts.
 - Gemini 429/5xx errors are retried and may fall back to another Flash model.
+- Fallback models have a short timeout so one busy model cannot hang the agent.
 """
 
 import json
 import os
 from pathlib import Path
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -26,7 +28,6 @@ import urllib.request
 DEFAULT_MODEL = "gemini-3.6-flash"
 MODEL = DEFAULT_MODEL
 PROJECT_ROOT = Path.cwd().resolve()
-SYSTEM_ROOT = Path("/")
 AUTO_APPROVE = False
 MAX_TOOL_STEPS = 16
 MAX_OUTPUT_CHARS = 30000
@@ -36,6 +37,9 @@ API_KEY = None
 KEY_FILE = Path.home() / ".azzagent_gemini_key"
 MODEL_FILE = Path.home() / ".azzagent_model"
 TRANSIENT_HTTP_CODES = (429, 500, 502, 503, 504)
+PRIMARY_TIMEOUT = 45
+FALLBACK_TIMEOUT = 12
+MODEL_LIST_TIMEOUT = 20
 
 
 class GeminiHTTPError(Exception):
@@ -43,6 +47,10 @@ class GeminiHTTPError(Exception):
         self.code = int(code)
         self.body = body
         Exception.__init__(self, "Gemini API HTTP %s: %s" % (self.code, body[:2000]))
+
+
+class GeminiTimeoutError(Exception):
+    pass
 
 
 def load_or_create_key():
@@ -153,9 +161,7 @@ def read_file(args):
         return "ERROR: not a readable file: %s" % p
     try:
         lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
-    except PermissionError:
-        return "ERROR: permission denied: %s" % p
-    except OSError as e:
+    except (PermissionError, OSError) as e:
         return "ERROR: %s" % e
     start = max(1, int(args.get("start_line", 1)))
     end = int(args.get("end_line", 0)) or min(len(lines), start + 399)
@@ -290,7 +296,7 @@ Never claim an action succeeded until the tool result confirms it.
 """ % PROJECT_ROOT
 
 
-def _model_request(model, prompt):
+def _model_request(model, prompt, timeout_seconds=PRIMARY_TIMEOUT):
     url = "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent" % model
     payload = {
         "systemInstruction": {"parts": [{"text": instructions()}]},
@@ -303,18 +309,23 @@ def _model_request(model, prompt):
         headers={
             "Content-Type": "application/json",
             "x-goog-api-key": API_KEY,
-            "User-Agent": "AzzAgent-Gemini/1.2",
+            "User-Agent": "AzzAgent-Gemini/1.3",
         },
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=180) as response:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
             data = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
         raise GeminiHTTPError(e.code, body)
+    except (socket.timeout, TimeoutError) as e:
+        raise GeminiTimeoutError("%s timed out after %ss" % (model, timeout_seconds))
     except urllib.error.URLError as e:
+        if isinstance(getattr(e, "reason", None), socket.timeout):
+            raise GeminiTimeoutError("%s timed out after %ss" % (model, timeout_seconds))
         raise RuntimeError("Network error: %s" % e)
+
     candidates = data.get("candidates", [])
     if not candidates:
         raise RuntimeError("Gemini returned no candidates")
@@ -331,16 +342,18 @@ def available_models():
         url,
         headers={
             "x-goog-api-key": API_KEY,
-            "User-Agent": "AzzAgent-Gemini/1.2",
+            "User-Agent": "AzzAgent-Gemini/1.3",
         },
         method="GET",
     )
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with urllib.request.urlopen(request, timeout=MODEL_LIST_TIMEOUT) as response:
             data = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
         raise GeminiHTTPError(e.code, body)
+    except (socket.timeout, TimeoutError):
+        raise GeminiTimeoutError("Model list timed out after %ss" % MODEL_LIST_TIMEOUT)
     except urllib.error.URLError as e:
         raise RuntimeError("Network error while listing models: %s" % e)
 
@@ -368,14 +381,20 @@ def _model_score(name):
     match = re.search(r"gemini-(\d+)(?:\.(\d+))?", low)
     if match:
         score += int(match.group(1)) * 1000 + int(match.group(2) or 0) * 100
-    if "lite" in low:
-        score -= 50
     return score
 
 
 def fallback_models(current):
     models = [m for m in available_models() if m != current and _model_score(m) > -100000]
-    models.sort(key=_model_score, reverse=True)
+
+    # Prefer lightweight Flash models during fallback. They are more likely to
+    # answer quickly when the larger Flash endpoints are overloaded/rate-limited.
+    def fallback_key(name):
+        low = name.lower()
+        lite_bonus = 100000 if "lite" in low else 0
+        return lite_bonus + _model_score(name)
+
+    models.sort(key=fallback_key, reverse=True)
     return models
 
 
@@ -385,9 +404,13 @@ def call_gemini(prompt):
 
     for attempt in range(3):
         try:
-            text = _model_request(MODEL, prompt)
+            text = _model_request(MODEL, prompt, PRIMARY_TIMEOUT)
             save_model(MODEL)
             return text
+        except GeminiTimeoutError as e:
+            last_error = e
+            print("\n[Gemini] %s" % e)
+            break
         except GeminiHTTPError as e:
             last_error = e
             if e.code == 404:
@@ -399,33 +422,44 @@ def call_gemini(prompt):
                 print("\n[Gemini] %s unavailable (HTTP %s). Retrying in %ss..." % (MODEL, e.code, delay))
                 time.sleep(delay)
 
-    if last_error and (last_error.code == 404 or last_error.code in TRANSIENT_HTTP_CODES):
-        print("\n[Gemini] Looking for another available Flash model...")
-        try:
-            alternatives = fallback_models(MODEL)
-        except Exception as discovery_error:
-            print("[Gemini] Could not list fallback models: %s" % discovery_error)
+    print("\n[Gemini] Looking for another available Flash model...")
+    try:
+        alternatives = fallback_models(MODEL)
+    except Exception as discovery_error:
+        print("[Gemini] Could not list fallback models: %s" % discovery_error)
+        if last_error:
             raise last_error
+        raise
 
-        for alternative in alternatives[:8]:
-            print("[Gemini] Trying %s..." % alternative)
-            try:
-                text = _model_request(alternative, prompt)
-                MODEL = alternative
-                save_model(MODEL)
-                print("[Gemini] Switched to %s (saved as default)" % MODEL)
-                return text
-            except GeminiHTTPError as e:
-                last_error = e
-                if e.code in TRANSIENT_HTTP_CODES or e.code == 404:
-                    continue
-                raise
-            except RuntimeError:
+    if not alternatives:
+        if last_error:
+            raise last_error
+        raise RuntimeError("No fallback Flash models available")
+
+    for alternative in alternatives[:10]:
+        print("[Gemini] Trying %s (max %ss)..." % (alternative, FALLBACK_TIMEOUT))
+        try:
+            text = _model_request(alternative, prompt, FALLBACK_TIMEOUT)
+            MODEL = alternative
+            save_model(MODEL)
+            print("[Gemini] Switched to %s (saved as default)" % MODEL)
+            return text
+        except GeminiTimeoutError:
+            print("[Gemini] %s timed out, skipping." % alternative)
+            continue
+        except GeminiHTTPError as e:
+            last_error = e
+            if e.code in TRANSIENT_HTTP_CODES or e.code == 404:
+                print("[Gemini] %s unavailable (HTTP %s), skipping." % (alternative, e.code))
                 continue
+            raise
+        except RuntimeError as e:
+            print("[Gemini] %s failed: %s" % (alternative, e))
+            continue
 
     if last_error:
         raise last_error
-    raise RuntimeError("Gemini request failed")
+    raise RuntimeError("No available Flash model responded")
 
 
 def parse_action(raw):
@@ -513,11 +547,12 @@ def main():
 
     MODEL = load_saved_model()
 
-    print("AzzAgent Gemini 1.2")
+    print("AzzAgent Gemini 1.3")
     print("Project root: %s" % PROJECT_ROOT)
     print("System read: /")
     print("Model: %s" % MODEL)
     print("Project approval default: YES")
+    print("Fallback timeout: %ss per model" % FALLBACK_TIMEOUT)
     print("Commands: /model, /model ID, /yes, /no, /forget-key, /quit")
 
     API_KEY = load_or_create_key()
