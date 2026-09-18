@@ -1,17 +1,17 @@
 #!/usr/local/bin/python3.9
 """
-AzzAgent Gemini 1.0
-32-bit-friendly coding/system agent for Python 3.9.
+AzzAgent Gemini 1.1
+Tiny 32-bit-friendly coding/system agent for Python 3.9.
 
-- Reads may inspect the whole Linux filesystem.
-- Normal file writes stay inside the project root.
-- System writes and system shell commands always require explicit approval.
-- API key is entered once, shown while typing, then saved locally.
-- Gemini 429/5xx errors are retried automatically.
-- If the selected Gemini model stays unavailable, AzzAgent discovers another
-  available Flash model from the API and continues automatically.
-- /model lists every generateContent model available to the current API key.
-- /model MODEL_ID switches model; /models is kept as an alias.
+Features:
+- Read anywhere on the Linux filesystem.
+- Normal writes stay inside the project root.
+- Project actions prompt [Y/n], so Enter means YES.
+- System writes/system shell still require explicit [y/N] approval.
+- /yes enables project auto-approve; /no disables it.
+- /model lists every generateContent model available to the API key.
+- /model MODEL_ID switches model.
+- Retries transient Gemini errors and can fall back to another Flash model.
 """
 
 import json
@@ -26,7 +26,6 @@ import urllib.request
 
 MODEL = "gemini-3.6-flash"
 PROJECT_ROOT = Path.cwd().resolve()
-SYSTEM_ROOT = Path("/")
 AUTO_APPROVE = False
 MAX_TOOL_STEPS = 16
 MAX_OUTPUT_CHARS = 30000
@@ -48,14 +47,17 @@ def load_or_create_key():
         key = KEY_FILE.read_text(encoding="utf-8").strip()
         if key:
             return key
+
     key = input("Gemini API key (shown while typing, saved after this): ").strip()
     if not key:
         return None
+
     KEY_FILE.write_text(key + "\n", encoding="utf-8")
     try:
         os.chmod(str(KEY_FILE), 0o600)
     except Exception:
         pass
+
     print("API key saved to %s" % KEY_FILE)
     return key
 
@@ -80,21 +82,25 @@ def resolve_project_write_path(value):
 def normal_approve(message):
     if AUTO_APPROVE:
         return True
-    return input("\n%s\nApprove? [y/N] " % message).strip().lower() in ("y", "yes")
+    answer = input("\n%s\nApprove? [Y/n] " % message).strip().lower()
+    return answer not in ("n", "no")
 
 
 def system_approve(message):
-    return input("\nSYSTEM ACTION: %s\nExplicitly approve? [y/N] " % message).strip().lower() in ("y", "yes")
+    answer = input("\nSYSTEM ACTION: %s\nExplicitly approve? [y/N] " % message).strip().lower()
+    return answer in ("y", "yes")
 
 
 def list_files(args):
     base = resolve_read_path(args.get("path", "."))
     recursive = bool(args.get("recursive", False))
     out = []
+
     if base.is_file():
         return str(base)
     if not base.exists():
-        return "ERROR: path does not exist"
+        return "ERROR: path does not exist: %s" % base
+
     try:
         if recursive:
             for current, dirs, files in os.walk(str(base)):
@@ -116,6 +122,9 @@ def list_files(args):
                     break
     except PermissionError:
         return "ERROR: permission denied: %s" % base
+    except OSError as e:
+        return "ERROR: %s" % e
+
     return "\n".join(out)
 
 
@@ -123,13 +132,18 @@ def read_file(args):
     p = resolve_read_path(args["path"])
     if not p.is_file():
         return "ERROR: not a readable file: %s" % p
+
     try:
         lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
-    except PermissionError:
-        return "ERROR: permission denied: %s" % p
+    except (PermissionError, OSError) as e:
+        return "ERROR: %s" % e
+
     start = max(1, int(args.get("start_line", 1)))
     end = int(args.get("end_line", 0)) or min(len(lines), start + 399)
-    text = "\n".join("%d: %s" % (i, line) for i, line in enumerate(lines[start - 1:end], start))
+    text = "\n".join(
+        "%d: %s" % (i, line)
+        for i, line in enumerate(lines[start - 1:end], start)
+    )
     return text[:MAX_OUTPUT_CHARS]
 
 
@@ -186,8 +200,15 @@ def shell(args):
     if not normal_approve("RUN PROJECT SHELL: %s" % command):
         return "DENIED"
     try:
-        result = subprocess.run(command, cwd=str(PROJECT_ROOT), shell=True, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, universal_newlines=True, timeout=120)
+        result = subprocess.run(
+            command,
+            cwd=str(PROJECT_ROOT),
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+            timeout=120,
+        )
         return ("exit=%d\n%s" % (result.returncode, result.stdout or ""))[:MAX_OUTPUT_CHARS]
     except subprocess.TimeoutExpired:
         return "ERROR: command timed out"
@@ -198,8 +219,15 @@ def system_shell(args):
     if not system_approve("RUN SYSTEM SHELL: %s" % command):
         return "DENIED"
     try:
-        result = subprocess.run(command, cwd="/", shell=True, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, universal_newlines=True, timeout=120)
+        result = subprocess.run(
+            command,
+            cwd="/",
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+            timeout=120,
+        )
         return ("exit=%d\n%s" % (result.returncode, result.stdout or ""))[:MAX_OUTPUT_CHARS]
     except subprocess.TimeoutExpired:
         return "ERROR: command timed out"
@@ -224,11 +252,13 @@ System root: /
 
 You may READ anywhere on the filesystem using list_files/read_file.
 Normal write_file/replace_text are restricted to the project root.
-For any change outside the project root, use system_write_file/system_replace_text or system_shell. Those always require explicit user approval, even when auto-approve is enabled.
-Inspect before editing. Do not invent file contents. Prefer read-only inspection before system actions.
+For changes outside the project root, use system_write_file/system_replace_text or system_shell. System actions require explicit user approval.
+Project actions use a [Y/n] prompt, so pressing Enter approves them.
+Inspect before editing. Do not invent file contents. Prefer read-only inspection before system changes.
+If the user explicitly asks you to modify AzzAgent itself, you MAY inspect and edit the agent script inside the project root. Tell the user a restart is needed for code changes to take effect.
 Return EXACTLY one JSON object and no markdown.
 
-Examples:
+Tool examples:
 {"type":"tool","tool":"list_files","args":{"path":"/etc","recursive":false}}
 {"type":"tool","tool":"read_file","args":{"path":"/etc/os-release","start_line":1,"end_line":100}}
 {"type":"tool","tool":"write_file","args":{"path":"main.py","content":"..."}}
@@ -238,7 +268,7 @@ Examples:
 {"type":"tool","tool":"system_write_file","args":{"path":"/etc/example.conf","content":"..."}}
 {"type":"tool","tool":"system_replace_text","args":{"path":"/etc/example.conf","old":"a","new":"b","count":1}}
 
-When finished:
+When finished or when you need to speak:
 {"type":"message","text":"your response"}
 Never claim an action succeeded until the tool result confirms it.
 """ % PROJECT_ROOT
@@ -254,8 +284,11 @@ def _model_request(model, prompt):
     request = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json", "x-goog-api-key": API_KEY,
-                 "User-Agent": "AzzAgent-Gemini/1.0"},
+        headers={
+            "Content-Type": "application/json",
+            "x-goog-api-key": API_KEY,
+            "User-Agent": "AzzAgent-Gemini/1.1",
+        },
         method="POST",
     )
     try:
@@ -266,6 +299,7 @@ def _model_request(model, prompt):
         raise GeminiHTTPError(e.code, body)
     except urllib.error.URLError as e:
         raise RuntimeError("Network error: %s" % e)
+
     candidates = data.get("candidates", [])
     if not candidates:
         raise RuntimeError("Gemini returned no candidates")
@@ -280,7 +314,10 @@ def available_models():
     url = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000"
     request = urllib.request.Request(
         url,
-        headers={"x-goog-api-key": API_KEY, "User-Agent": "AzzAgent-Gemini/1.0"},
+        headers={
+            "x-goog-api-key": API_KEY,
+            "User-Agent": "AzzAgent-Gemini/1.1",
+        },
         method="GET",
     )
     try:
@@ -330,6 +367,7 @@ def fallback_models(current):
 def call_gemini(prompt):
     global MODEL
     last_error = None
+
     for attempt in range(3):
         try:
             return _model_request(MODEL, prompt)
@@ -351,6 +389,7 @@ def call_gemini(prompt):
         except Exception as discovery_error:
             print("[Gemini] Could not list fallback models: %s" % discovery_error)
             raise last_error
+
         for alternative in alternatives[:8]:
             print("[Gemini] Trying %s..." % alternative)
             try:
@@ -365,6 +404,7 @@ def call_gemini(prompt):
                 raise
             except RuntimeError:
                 continue
+
     if last_error:
         raise last_error
     raise RuntimeError("Gemini request failed")
@@ -394,26 +434,37 @@ def build_prompt(user_text):
             top.append(item.name + ("/" if item.is_dir() else ""))
     except Exception:
         pass
-    recent = "\n".join("%s: %s" % (entry["role"].upper(), entry["text"]) for entry in HISTORY[-24:])
-    return "Project files:\n%s\n\nRecent session:\n%s\n\nUSER: %s" % ("\n".join(top), recent, user_text)
+
+    recent = "\n".join(
+        "%s: %s" % (entry["role"].upper(), entry["text"])
+        for entry in HISTORY[-24:]
+    )
+    return "Project files:\n%s\n\nRecent session:\n%s\n\nUSER: %s" % (
+        "\n".join(top), recent, user_text
+    )
 
 
 def run_turn(user_text):
     HISTORY.append({"role": "user", "text": user_text})
     prompt = build_prompt(user_text)
+
     for _ in range(MAX_TOOL_STEPS):
         action = parse_action(call_gemini(prompt))
+
         if action.get("type") == "message":
             text = action.get("text", "")
             print("\nAgent: " + text)
             HISTORY.append({"role": "assistant", "text": text})
             return
+
         if action.get("type") != "tool":
             print("\nAgent error: unknown action: %r" % action)
             return
+
         name = action.get("tool")
         args = action.get("args", {})
         print("\n[" + str(name) + "]")
+
         if name not in TOOLS:
             result = "ERROR: unknown tool %s" % name
         else:
@@ -421,9 +472,11 @@ def run_turn(user_text):
                 result = TOOLS[name](args)
             except Exception as e:
                 result = "ERROR: %s" % e
+
         print(result[:4000])
         HISTORY.append({"role": "tool", "text": result})
         prompt = build_prompt("Continue the task. Latest tool result:\n" + result)
+
     print("\nStopped after %d tool steps." % MAX_TOOL_STEPS)
 
 
@@ -433,9 +486,11 @@ def show_models():
     except Exception as e:
         print("Could not list models: %s" % e)
         return
+
     if not models:
         print("No generateContent models returned for this API key.")
         return
+
     print("Available models (%d):" % len(models))
     for name in models:
         marker = "  < current" if name == MODEL else ""
@@ -445,21 +500,26 @@ def show_models():
 
 def main():
     global MODEL, AUTO_APPROVE, API_KEY
-    print("AzzAgent Gemini 1.0")
+
+    print("AzzAgent Gemini 1.1")
     print("Project root: %s" % PROJECT_ROOT)
     print("System read: /")
     print("Model: %s" % MODEL)
+    print("Project approval default: YES")
     print("Commands: /model, /model ID, /yes, /no, /forget-key, /quit")
+
     API_KEY = load_or_create_key()
     if not API_KEY:
         print("No Gemini API key supplied.")
         return 1
+
     while True:
         try:
             user_text = input("\nYou> ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
+
         if not user_text:
             continue
         if user_text in ("/quit", "/exit", "quit", "exit"):
@@ -473,11 +533,11 @@ def main():
             continue
         if user_text == "/yes":
             AUTO_APPROVE = True
-            print("Project auto-approve ON. System actions still require approval.")
+            print("Project auto-approve ON. System actions still require explicit approval.")
             continue
         if user_text == "/no":
             AUTO_APPROVE = False
-            print("Auto-approve OFF")
+            print("Project auto-approve OFF. Project prompts still default to YES.")
             continue
         if user_text == "/forget-key":
             try:
@@ -486,10 +546,12 @@ def main():
             except FileNotFoundError:
                 print("No saved Gemini API key found.")
             continue
+
         try:
             run_turn(user_text)
         except Exception as e:
             print("\nERROR: %s" % e)
+
     return 0
 
 
