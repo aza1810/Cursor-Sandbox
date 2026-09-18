@@ -2,10 +2,9 @@
 """
 AzzAgent Gemini
 Tiny 32-bit-friendly coding agent for Python 3.9.
-Prompts for your Gemini API key only on first run, then saves it locally.
+Prompts for your Gemini API key only on first run, shows what you type, then saves it locally.
 """
 
-import getpass
 import json
 import os
 from pathlib import Path
@@ -30,7 +29,7 @@ def load_or_create_key():
         if key:
             return key
 
-    key = getpass.getpass("Gemini API key (saved after this): ").strip()
+    key = input("Gemini API key (shown while typing, saved after this): ").strip()
     if not key:
         return None
 
@@ -180,7 +179,7 @@ def call_gemini(prompt):
         headers={
             "Content-Type": "application/json",
             "x-goog-api-key": API_KEY,
-            "User-Agent": "AzzAgent-Gemini/0.5",
+            "User-Agent": "AzzAgent-Gemini/0.6",
         },
         method="POST",
     )
@@ -261,7 +260,7 @@ def run_turn(user_text):
 
 def main():
     global MODEL, AUTO_APPROVE, API_KEY
-    print("AzzAgent Gemini 0.5")
+    print("AzzAgent Gemini 0.6")
     print("Project: %s" % ROOT)
     print("Model:   %s" % MODEL)
     print("Commands: /model ID, /yes, /no, /forget-key, /quit")
