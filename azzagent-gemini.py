@@ -1,19 +1,24 @@
 #!/usr/local/bin/python3.9
 """
-AzzAgent Gemini 0.8
+AzzAgent Gemini 0.9
 32-bit-friendly coding/system agent for Python 3.9.
 
 - Reads may inspect the whole Linux filesystem.
-- Normal writes stay inside the project root.
+- Normal file writes stay inside the project root.
 - System writes and system shell commands always require explicit approval.
 - API key is entered once, shown while typing, then saved locally.
+- Gemini 429/5xx errors are retried automatically.
+- If the selected Gemini model stays unavailable, AzzAgent discovers another
+  available Flash model from the API and continues automatically.
 """
 
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -26,6 +31,14 @@ MAX_OUTPUT_CHARS = 30000
 HISTORY = []
 API_KEY = None
 KEY_FILE = Path.home() / ".azzagent_gemini_key"
+TRANSIENT_HTTP_CODES = (429, 500, 502, 503, 504)
+
+
+class GeminiHTTPError(Exception):
+    def __init__(self, code, body):
+        self.code = int(code)
+        self.body = body
+        Exception.__init__(self, "Gemini API HTTP %s: %s" % (self.code, body[:2000]))
 
 
 def load_or_create_key():
@@ -80,24 +93,27 @@ def list_files(args):
         return str(base)
     if not base.exists():
         return "ERROR: path does not exist"
-    if recursive:
-        for current, dirs, files in os.walk(str(base)):
-            dirs[:] = sorted(d for d in dirs if d not in (".git", "node_modules", "__pycache__"))
-            cur = Path(current)
-            for d in dirs:
-                out.append(str(cur / d) + "/")
+    try:
+        if recursive:
+            for current, dirs, files in os.walk(str(base)):
+                dirs[:] = sorted(d for d in dirs if d not in (".git", "node_modules", "__pycache__"))
+                cur = Path(current)
+                for d in dirs:
+                    out.append(str(cur / d) + "/")
+                    if len(out) >= 300:
+                        return "\n".join(out) + "\n... truncated"
+                for f in sorted(files):
+                    out.append(str(cur / f))
+                    if len(out) >= 300:
+                        return "\n".join(out) + "\n... truncated"
+        else:
+            for item in sorted(base.iterdir(), key=lambda x: x.name.lower()):
+                out.append(str(item) + ("/" if item.is_dir() else ""))
                 if len(out) >= 300:
-                    return "\n".join(out) + "\n... truncated"
-            for f in sorted(files):
-                out.append(str(cur / f))
-                if len(out) >= 300:
-                    return "\n".join(out) + "\n... truncated"
-    else:
-        for item in sorted(base.iterdir(), key=lambda x: x.name.lower()):
-            out.append(str(item) + ("/" if item.is_dir() else ""))
-            if len(out) >= 300:
-                out.append("... truncated")
-                break
+                    out.append("... truncated")
+                    break
+    except PermissionError:
+        return "ERROR: permission denied: %s" % base
     return "\n".join(out)
 
 
@@ -105,7 +121,10 @@ def read_file(args):
     p = resolve_read_path(args["path"])
     if not p.is_file():
         return "ERROR: not a readable file: %s" % p
-    lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    try:
+        lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    except PermissionError:
+        return "ERROR: permission denied: %s" % p
     start = max(1, int(args.get("start_line", 1)))
     end = int(args.get("end_line", 0)) or min(len(lines), start + 399)
     text = "\n".join("%d: %s" % (i, line) for i, line in enumerate(lines[start - 1:end], start))
@@ -223,8 +242,8 @@ Never claim an action succeeded until the tool result confirms it.
 """ % PROJECT_ROOT
 
 
-def call_gemini(prompt):
-    url = "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent" % MODEL
+def _model_request(model, prompt):
+    url = "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent" % model
     payload = {
         "systemInstruction": {"parts": [{"text": instructions()}]},
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
@@ -234,7 +253,7 @@ def call_gemini(prompt):
         url,
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json", "x-goog-api-key": API_KEY,
-                 "User-Agent": "AzzAgent-Gemini/0.8"},
+                 "User-Agent": "AzzAgent-Gemini/0.9"},
         method="POST",
     )
     try:
@@ -242,7 +261,7 @@ def call_gemini(prompt):
             data = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError("Gemini API HTTP %s: %s" % (e.code, body[:2000]))
+        raise GeminiHTTPError(e.code, body)
     except urllib.error.URLError as e:
         raise RuntimeError("Network error: %s" % e)
     candidates = data.get("candidates", [])
@@ -253,6 +272,107 @@ def call_gemini(prompt):
     if not text:
         raise RuntimeError("Gemini returned no text")
     return text
+
+
+def available_models():
+    url = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000"
+    request = urllib.request.Request(
+        url,
+        headers={"x-goog-api-key": API_KEY, "User-Agent": "AzzAgent-Gemini/0.9"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise GeminiHTTPError(e.code, body)
+    except urllib.error.URLError as e:
+        raise RuntimeError("Network error while listing models: %s" % e)
+
+    result = []
+    for item in data.get("models", []):
+        methods = item.get("supportedGenerationMethods", [])
+        if "generateContent" not in methods:
+            continue
+        name = item.get("name", "")
+        if name.startswith("models/"):
+            name = name[7:]
+        if name:
+            result.append(name)
+    return result
+
+
+def _model_score(name):
+    low = name.lower()
+    if "gemini" not in low or "flash" not in low:
+        return -100000
+    if any(bad in low for bad in ("embedding", "image", "tts", "live")):
+        return -100000
+    score = 0
+    if not any(tag in low for tag in ("preview", "experimental", "exp")):
+        score += 10000
+    match = re.search(r"gemini-(\d+)(?:\.(\d+))?", low)
+    if match:
+        major = int(match.group(1))
+        minor = int(match.group(2) or 0)
+        score += major * 1000 + minor * 100
+    if "lite" in low:
+        score -= 50
+    return score
+
+
+def fallback_models(current):
+    models = available_models()
+    models = [m for m in models if m != current and _model_score(m) > -100000]
+    models.sort(key=_model_score, reverse=True)
+    return models
+
+
+def call_gemini(prompt):
+    global MODEL
+    last_error = None
+
+    for attempt in range(3):
+        try:
+            return _model_request(MODEL, prompt)
+        except GeminiHTTPError as e:
+            last_error = e
+            if e.code == 404:
+                break
+            if e.code not in TRANSIENT_HTTP_CODES:
+                raise
+            if attempt < 2:
+                delay = (2, 5)[attempt]
+                print("\n[Gemini] %s unavailable (HTTP %s). Retrying in %ss..." % (MODEL, e.code, delay))
+                time.sleep(delay)
+
+    if last_error and (last_error.code == 404 or last_error.code in TRANSIENT_HTTP_CODES):
+        print("\n[Gemini] Looking for another available Flash model...")
+        try:
+            alternatives = fallback_models(MODEL)
+        except Exception as discovery_error:
+            print("[Gemini] Could not list fallback models: %s" % discovery_error)
+            raise last_error
+
+        for alternative in alternatives[:8]:
+            print("[Gemini] Trying %s..." % alternative)
+            try:
+                text = _model_request(alternative, prompt)
+                MODEL = alternative
+                print("[Gemini] Switched to %s" % MODEL)
+                return text
+            except GeminiHTTPError as e:
+                last_error = e
+                if e.code in TRANSIENT_HTTP_CODES or e.code == 404:
+                    continue
+                raise
+            except RuntimeError:
+                continue
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("Gemini request failed")
 
 
 def parse_action(raw):
@@ -312,13 +432,30 @@ def run_turn(user_text):
     print("\nStopped after %d tool steps." % MAX_TOOL_STEPS)
 
 
+def show_models():
+    try:
+        models = available_models()
+    except Exception as e:
+        print("Could not list models: %s" % e)
+        return
+    flash = [m for m in models if _model_score(m) > -100000]
+    flash.sort(key=_model_score, reverse=True)
+    if not flash:
+        print("No generateContent Flash models returned for this API key.")
+        return
+    print("Available Flash models:")
+    for name in flash:
+        marker = " *" if name == MODEL else ""
+        print("  %s%s" % (name, marker))
+
+
 def main():
     global MODEL, AUTO_APPROVE, API_KEY
-    print("AzzAgent Gemini 0.8")
+    print("AzzAgent Gemini 0.9")
     print("Project root: %s" % PROJECT_ROOT)
     print("System read: /")
     print("Model: %s" % MODEL)
-    print("Commands: /model ID, /yes, /no, /forget-key, /quit")
+    print("Commands: /model ID, /models, /yes, /no, /forget-key, /quit")
     API_KEY = load_or_create_key()
     if not API_KEY:
         print("No Gemini API key supplied.")
@@ -336,6 +473,9 @@ def main():
         if user_text.startswith("/model "):
             MODEL = user_text.split(None, 1)[1].strip()
             print("Model: " + MODEL)
+            continue
+        if user_text == "/models":
+            show_models()
             continue
         if user_text == "/yes":
             AUTO_APPROVE = True
