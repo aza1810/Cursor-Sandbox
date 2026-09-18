@@ -1,8 +1,12 @@
 #!/usr/local/bin/python3.9
 """
-AzzAgent Gemini
-Tiny 32-bit-friendly coding agent for Python 3.9.
-Prompts for your Gemini API key only on first run, shows what you type, then saves it locally.
+AzzAgent Gemini 0.8
+32-bit-friendly coding/system agent for Python 3.9.
+
+- Reads may inspect the whole Linux filesystem.
+- Normal writes stay inside the project root.
+- System writes and system shell commands always require explicit approval.
+- API key is entered once, shown while typing, then saved locally.
 """
 
 import json
@@ -14,9 +18,10 @@ import urllib.error
 import urllib.request
 
 MODEL = "gemini-3.6-flash"
-ROOT = Path.cwd().resolve()
+PROJECT_ROOT = Path.cwd().resolve()
+SYSTEM_ROOT = Path("/")
 AUTO_APPROVE = False
-MAX_TOOL_STEPS = 12
+MAX_TOOL_STEPS = 16
 MAX_OUTPUT_CHARS = 30000
 HISTORY = []
 API_KEY = None
@@ -28,64 +33,78 @@ def load_or_create_key():
         key = KEY_FILE.read_text(encoding="utf-8").strip()
         if key:
             return key
-
     key = input("Gemini API key (shown while typing, saved after this): ").strip()
     if not key:
         return None
-
     KEY_FILE.write_text(key + "\n", encoding="utf-8")
     try:
         os.chmod(str(KEY_FILE), 0o600)
     except Exception:
         pass
-
     print("API key saved to %s" % KEY_FILE)
     return key
 
 
-def safe_path(value):
+def resolve_read_path(value):
     p = Path(value)
     if not p.is_absolute():
-        p = ROOT / p
+        p = PROJECT_ROOT / p
+    return p.resolve()
+
+
+def resolve_project_write_path(value):
+    p = Path(value)
+    if not p.is_absolute():
+        p = PROJECT_ROOT / p
     p = p.resolve()
-    if p != ROOT and ROOT not in p.parents:
-        raise ValueError("Path is outside the project root")
+    if p != PROJECT_ROOT and PROJECT_ROOT not in p.parents:
+        raise ValueError("Write path is outside the project root")
     return p
 
 
-def approve(message):
+def normal_approve(message):
     if AUTO_APPROVE:
         return True
-    answer = input("\n%s\nApprove? [y/N] " % message).strip().lower()
-    return answer in ("y", "yes")
+    return input("\n%s\nApprove? [y/N] " % message).strip().lower() in ("y", "yes")
+
+
+def system_approve(message):
+    return input("\nSYSTEM ACTION: %s\nExplicitly approve? [y/N] " % message).strip().lower() in ("y", "yes")
 
 
 def list_files(args):
-    base = safe_path(args.get("path", "."))
+    base = resolve_read_path(args.get("path", "."))
     recursive = bool(args.get("recursive", False))
     out = []
     if base.is_file():
-        return str(base.relative_to(ROOT))
+        return str(base)
+    if not base.exists():
+        return "ERROR: path does not exist"
     if recursive:
         for current, dirs, files in os.walk(str(base)):
             dirs[:] = sorted(d for d in dirs if d not in (".git", "node_modules", "__pycache__"))
             cur = Path(current)
             for d in dirs:
-                out.append(str((cur / d).relative_to(ROOT)) + "/")
-                if len(out) >= 250:
+                out.append(str(cur / d) + "/")
+                if len(out) >= 300:
                     return "\n".join(out) + "\n... truncated"
             for f in sorted(files):
-                out.append(str((cur / f).relative_to(ROOT)))
-                if len(out) >= 250:
+                out.append(str(cur / f))
+                if len(out) >= 300:
                     return "\n".join(out) + "\n... truncated"
     else:
         for item in sorted(base.iterdir(), key=lambda x: x.name.lower()):
-            out.append(str(item.relative_to(ROOT)) + ("/" if item.is_dir() else ""))
+            out.append(str(item) + ("/" if item.is_dir() else ""))
+            if len(out) >= 300:
+                out.append("... truncated")
+                break
     return "\n".join(out)
 
 
 def read_file(args):
-    p = safe_path(args["path"])
+    p = resolve_read_path(args["path"])
+    if not p.is_file():
+        return "ERROR: not a readable file: %s" % p
     lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
     start = max(1, int(args.get("start_line", 1)))
     end = int(args.get("end_line", 0)) or min(len(lines), start + 399)
@@ -94,46 +113,75 @@ def read_file(args):
 
 
 def write_file(args):
-    p = safe_path(args["path"])
+    p = resolve_project_write_path(args["path"])
     content = args.get("content", "")
-    if not approve("WRITE " + str(p.relative_to(ROOT))):
+    if not normal_approve("WRITE %s" % p):
         return "DENIED"
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
-    return "WROTE " + str(p.relative_to(ROOT))
+    return "WROTE %s" % p
 
 
 def replace_text(args):
-    p = safe_path(args["path"])
+    p = resolve_project_write_path(args["path"])
     old = args["old"]
     new = args["new"]
     count = int(args.get("count", 1))
     text = p.read_text(encoding="utf-8")
     if old not in text:
         return "ERROR: old text not found"
-    if not approve("EDIT " + str(p.relative_to(ROOT))):
+    if not normal_approve("EDIT %s" % p):
         return "DENIED"
     p.write_text(text.replace(old, new, count), encoding="utf-8")
-    return "EDITED " + str(p.relative_to(ROOT))
+    return "EDITED %s" % p
+
+
+def system_write_file(args):
+    p = resolve_read_path(args["path"])
+    content = args.get("content", "")
+    if not system_approve("WRITE SYSTEM FILE %s" % p):
+        return "DENIED"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content, encoding="utf-8")
+    return "SYSTEM WRITE COMPLETE: %s" % p
+
+
+def system_replace_text(args):
+    p = resolve_read_path(args["path"])
+    old = args["old"]
+    new = args["new"]
+    count = int(args.get("count", 1))
+    text = p.read_text(encoding="utf-8")
+    if old not in text:
+        return "ERROR: old text not found"
+    if not system_approve("EDIT SYSTEM FILE %s" % p):
+        return "DENIED"
+    p.write_text(text.replace(old, new, count), encoding="utf-8")
+    return "SYSTEM EDIT COMPLETE: %s" % p
 
 
 def shell(args):
     command = args["command"]
-    if not approve("RUN: " + command):
+    if not normal_approve("RUN PROJECT SHELL: %s" % command):
         return "DENIED"
     try:
-        result = subprocess.run(
-            command,
-            cwd=str(ROOT),
-            shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            universal_newlines=True,
-            timeout=120,
-        )
+        result = subprocess.run(command, cwd=str(PROJECT_ROOT), shell=True, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, universal_newlines=True, timeout=120)
         return ("exit=%d\n%s" % (result.returncode, result.stdout or ""))[:MAX_OUTPUT_CHARS]
     except subprocess.TimeoutExpired:
-        return "ERROR: command timed out after 120 seconds"
+        return "ERROR: command timed out"
+
+
+def system_shell(args):
+    command = args["command"]
+    if not system_approve("RUN SYSTEM SHELL: %s" % command):
+        return "DENIED"
+    try:
+        result = subprocess.run(command, cwd="/", shell=True, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, universal_newlines=True, timeout=120)
+        return ("exit=%d\n%s" % (result.returncode, result.stdout or ""))[:MAX_OUTPUT_CHARS]
+    except subprocess.TimeoutExpired:
+        return "ERROR: command timed out"
 
 
 TOOLS = {
@@ -141,29 +189,38 @@ TOOLS = {
     "read_file": read_file,
     "write_file": write_file,
     "replace_text": replace_text,
+    "system_write_file": system_write_file,
+    "system_replace_text": system_replace_text,
     "shell": shell,
+    "system_shell": system_shell,
 }
 
 
 def instructions():
-    return """You are AzzAgent, a coding agent running on a very small 32-bit Linux computer.
+    return """You are AzzAgent, a coding and Linux system agent on a small 32-bit Linux machine.
 Project root: %s
+System root: /
 
-Work iteratively. Inspect existing files before editing them. Do not invent file contents.
-Use tools to inspect, edit, create and test code.
+You may READ anywhere on the filesystem using list_files/read_file.
+Normal write_file/replace_text are restricted to the project root.
+For any change outside the project root, use system_write_file/system_replace_text or system_shell. Those always require explicit user approval, even when auto-approve is enabled.
+Inspect before editing. Do not invent file contents. Prefer read-only inspection before system actions.
 Return EXACTLY one JSON object and no markdown.
 
-Tool calls:
-{"type":"tool","tool":"list_files","args":{"path":".","recursive":false}}
-{"type":"tool","tool":"read_file","args":{"path":"file.py","start_line":1,"end_line":200}}
-{"type":"tool","tool":"write_file","args":{"path":"file.py","content":"..."}}
-{"type":"tool","tool":"replace_text","args":{"path":"file.py","old":"exact old text","new":"replacement","count":1}}
+Examples:
+{"type":"tool","tool":"list_files","args":{"path":"/etc","recursive":false}}
+{"type":"tool","tool":"read_file","args":{"path":"/etc/os-release","start_line":1,"end_line":100}}
+{"type":"tool","tool":"write_file","args":{"path":"main.py","content":"..."}}
+{"type":"tool","tool":"replace_text","args":{"path":"main.py","old":"x","new":"y","count":1}}
 {"type":"tool","tool":"shell","args":{"command":"python3.9 test.py"}}
+{"type":"tool","tool":"system_shell","args":{"command":"uname -a"}}
+{"type":"tool","tool":"system_write_file","args":{"path":"/etc/example.conf","content":"..."}}
+{"type":"tool","tool":"system_replace_text","args":{"path":"/etc/example.conf","old":"a","new":"b","count":1}}
 
-When finished or when you need to speak to the user:
+When finished:
 {"type":"message","text":"your response"}
-Never claim an edit or command succeeded until the tool result confirms it.
-""" % ROOT
+Never claim an action succeeded until the tool result confirms it.
+""" % PROJECT_ROOT
 
 
 def call_gemini(prompt):
@@ -176,11 +233,8 @@ def call_gemini(prompt):
     request = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "x-goog-api-key": API_KEY,
-            "User-Agent": "AzzAgent-Gemini/0.7",
-        },
+        headers={"Content-Type": "application/json", "x-goog-api-key": API_KEY,
+                 "User-Agent": "AzzAgent-Gemini/0.8"},
         method="POST",
     )
     try:
@@ -221,12 +275,12 @@ def parse_action(raw):
 def build_prompt(user_text):
     top = []
     try:
-        for item in sorted(ROOT.iterdir(), key=lambda x: x.name.lower())[:80]:
+        for item in sorted(PROJECT_ROOT.iterdir(), key=lambda x: x.name.lower())[:80]:
             top.append(item.name + ("/" if item.is_dir() else ""))
     except Exception:
         pass
     recent = "\n".join("%s: %s" % (entry["role"].upper(), entry["text"]) for entry in HISTORY[-24:])
-    return "Top-level files:\n%s\n\nRecent session:\n%s\n\nUSER: %s" % ("\n".join(top), recent, user_text)
+    return "Project files:\n%s\n\nRecent session:\n%s\n\nUSER: %s" % ("\n".join(top), recent, user_text)
 
 
 def run_turn(user_text):
@@ -244,32 +298,31 @@ def run_turn(user_text):
             return
         name = action.get("tool")
         args = action.get("args", {})
+        print("\n[" + str(name) + "]")
         if name not in TOOLS:
-            result = "ERROR: unknown tool " + str(name)
+            result = "ERROR: unknown tool %s" % name
         else:
-            print("\n[" + str(name) + "]")
             try:
                 result = TOOLS[name](args)
             except Exception as e:
-                result = "ERROR: " + str(e)
+                result = "ERROR: %s" % e
         print(result[:4000])
         HISTORY.append({"role": "tool", "text": result})
-        prompt = build_prompt("Continue the task. The latest tool result is:\n" + result)
+        prompt = build_prompt("Continue the task. Latest tool result:\n" + result)
     print("\nStopped after %d tool steps." % MAX_TOOL_STEPS)
 
 
 def main():
     global MODEL, AUTO_APPROVE, API_KEY
-    print("AzzAgent Gemini 0.7")
-    print("Project: %s" % ROOT)
-    print("Model:   %s" % MODEL)
+    print("AzzAgent Gemini 0.8")
+    print("Project root: %s" % PROJECT_ROOT)
+    print("System read: /")
+    print("Model: %s" % MODEL)
     print("Commands: /model ID, /yes, /no, /forget-key, /quit")
-
     API_KEY = load_or_create_key()
     if not API_KEY:
         print("No Gemini API key supplied.")
         return 1
-
     while True:
         try:
             user_text = input("\nYou> ").strip()
@@ -286,7 +339,7 @@ def main():
             continue
         if user_text == "/yes":
             AUTO_APPROVE = True
-            print("Auto-approve ON")
+            print("Project auto-approve ON. System actions still require approval.")
             continue
         if user_text == "/no":
             AUTO_APPROVE = False
@@ -295,7 +348,7 @@ def main():
         if user_text == "/forget-key":
             try:
                 KEY_FILE.unlink()
-                print("Saved Gemini API key removed. Restart AzzAgent to enter a new one.")
+                print("Saved Gemini API key removed. Restart to enter a new one.")
             except FileNotFoundError:
                 print("No saved Gemini API key found.")
             continue
