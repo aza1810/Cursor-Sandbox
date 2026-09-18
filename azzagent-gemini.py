@@ -1,17 +1,16 @@
 #!/usr/local/bin/python3.9
 """
-AzzAgent Gemini 1.3
-32-bit-friendly coding/system agent for Python 3.9.
+AzzAgent Gemini 1.4
+Tiny 32-bit-friendly coding/system agent for Python 3.9.
 
 - Reads may inspect the whole Linux filesystem.
-- Normal file writes stay inside the project root.
-- System writes and system shell commands always require explicit approval.
-- Project actions default to YES when the approval prompt is left blank.
-- API key is entered once, shown while typing, then saved locally.
-- /model lists every generateContent model available to the current API key.
-- The last successfully selected/used model is remembered across restarts.
-- Gemini 429/5xx errors are retried and may fall back to another Flash model.
-- Fallback models have a short timeout so one busy model cannot hang the agent.
+- Normal writes stay inside the project root.
+- Project AND system approval prompts default to YES when left blank.
+- API key is entered once and saved locally.
+- /model lists all generateContent models available to the API key.
+- The last successfully used model is remembered across restarts.
+- Retries/fallbacks use short timeouts so busy models do not look frozen.
+- Clear live status: Sent, Thinking, Received, Reply, Tool, Command and Done.
 """
 
 import json
@@ -21,6 +20,7 @@ import re
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -37,9 +37,10 @@ API_KEY = None
 KEY_FILE = Path.home() / ".azzagent_gemini_key"
 MODEL_FILE = Path.home() / ".azzagent_model"
 TRANSIENT_HTTP_CODES = (429, 500, 502, 503, 504)
-PRIMARY_TIMEOUT = 45
-FALLBACK_TIMEOUT = 12
+PRIMARY_TIMEOUT = 25
+FALLBACK_TIMEOUT = 10
 MODEL_LIST_TIMEOUT = 20
+HEARTBEAT_SECONDS = 3
 
 
 class GeminiHTTPError(Exception):
@@ -66,7 +67,7 @@ def load_or_create_key():
         os.chmod(str(KEY_FILE), 0o600)
     except Exception:
         pass
-    print("API key saved to %s" % KEY_FILE)
+    print("[Saved] API key -> %s" % KEY_FILE)
     return key
 
 
@@ -89,7 +90,7 @@ def save_model(model):
         except Exception:
             pass
     except Exception as e:
-        print("[AzzAgent] Warning: could not save model preference: %s" % e)
+        print("[Warning] Could not save model preference: %s" % e)
 
 
 def resolve_read_path(value):
@@ -111,14 +112,15 @@ def resolve_project_write_path(value):
 
 def normal_approve(message):
     if AUTO_APPROVE:
+        print("[Approved] project auto-approve")
         return True
     answer = input("\n%s\nApprove? [Y/n] " % message).strip().lower()
     return answer in ("", "y", "yes")
 
 
 def system_approve(message):
-    answer = input("\nSYSTEM ACTION: %s\nExplicitly approve? [y/N] " % message).strip().lower()
-    return answer in ("y", "yes")
+    answer = input("\nSYSTEM ACTION: %s\nApprove? [Y/n] " % message).strip().lower()
+    return answer in ("", "y", "yes")
 
 
 def list_files(args):
@@ -128,7 +130,7 @@ def list_files(args):
     if base.is_file():
         return str(base)
     if not base.exists():
-        return "ERROR: path does not exist"
+        return "ERROR: path does not exist: %s" % base
     try:
         if recursive:
             for current, dirs, files in os.walk(str(base)):
@@ -148,9 +150,7 @@ def list_files(args):
                 if len(out) >= 300:
                     out.append("... truncated")
                     break
-    except PermissionError:
-        return "ERROR: permission denied: %s" % base
-    except OSError as e:
+    except (PermissionError, OSError) as e:
         return "ERROR: %s" % e
     return "\n".join(out)
 
@@ -217,42 +217,39 @@ def system_replace_text(args):
     return "SYSTEM EDIT COMPLETE: %s" % p
 
 
-def shell(args):
-    command = args["command"]
-    if not normal_approve("RUN PROJECT SHELL: %s" % command):
+def _run_shell(command, cwd, approval_message, system=False):
+    approve = system_approve if system else normal_approve
+    if not approve(approval_message):
         return "DENIED"
+    started = time.time()
+    print("[Command] %s" % command)
+    print("[Running] cwd=%s" % cwd)
     try:
         result = subprocess.run(
             command,
-            cwd=str(PROJECT_ROOT),
+            cwd=str(cwd),
             shell=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             universal_newlines=True,
             timeout=120,
         )
+        elapsed = time.time() - started
+        print("[Done] exit=%d | %.1fs" % (result.returncode, elapsed))
         return ("exit=%d\n%s" % (result.returncode, result.stdout or ""))[:MAX_OUTPUT_CHARS]
     except subprocess.TimeoutExpired:
-        return "ERROR: command timed out"
+        print("[Done] TIMEOUT after 120s")
+        return "ERROR: command timed out after 120 seconds"
+
+
+def shell(args):
+    command = args["command"]
+    return _run_shell(command, PROJECT_ROOT, "RUN PROJECT SHELL: %s" % command, False)
 
 
 def system_shell(args):
     command = args["command"]
-    if not system_approve("RUN SYSTEM SHELL: %s" % command):
-        return "DENIED"
-    try:
-        result = subprocess.run(
-            command,
-            cwd="/",
-            shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            universal_newlines=True,
-            timeout=120,
-        )
-        return ("exit=%d\n%s" % (result.returncode, result.stdout or ""))[:MAX_OUTPUT_CHARS]
-    except subprocess.TimeoutExpired:
-        return "ERROR: command timed out"
+    return _run_shell(command, "/", "RUN SYSTEM SHELL: %s" % command, True)
 
 
 TOOLS = {
@@ -274,8 +271,8 @@ System root: /
 
 You may READ anywhere on the filesystem using list_files/read_file.
 Normal write_file/replace_text are restricted to the project root.
-For changes outside the project root, use system_write_file/system_replace_text or system_shell. These require explicit user approval.
-Project shell/file actions may be approved by the user's configured default.
+For changes outside the project root, use system_write_file/system_replace_text or system_shell.
+Both project and system approval prompts default to YES when the user presses Enter, but system actions still show a SYSTEM ACTION prompt.
 You are allowed to inspect and modify AzzAgent's own script when the user explicitly asks you to improve or change AzzAgent.
 Inspect before editing. Do not invent file contents. Prefer read-only inspection before system changes.
 Return EXACTLY one JSON object and no markdown.
@@ -296,7 +293,7 @@ Never claim an action succeeded until the tool result confirms it.
 """ % PROJECT_ROOT
 
 
-def _model_request(model, prompt, timeout_seconds=PRIMARY_TIMEOUT):
+def _raw_model_request(model, prompt, timeout_seconds):
     url = "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent" % model
     payload = {
         "systemInstruction": {"parts": [{"text": instructions()}]},
@@ -309,7 +306,7 @@ def _model_request(model, prompt, timeout_seconds=PRIMARY_TIMEOUT):
         headers={
             "Content-Type": "application/json",
             "x-goog-api-key": API_KEY,
-            "User-Agent": "AzzAgent-Gemini/1.3",
+            "User-Agent": "AzzAgent-Gemini/1.4",
         },
         method="POST",
     )
@@ -319,7 +316,7 @@ def _model_request(model, prompt, timeout_seconds=PRIMARY_TIMEOUT):
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
         raise GeminiHTTPError(e.code, body)
-    except (socket.timeout, TimeoutError) as e:
+    except (socket.timeout, TimeoutError):
         raise GeminiTimeoutError("%s timed out after %ss" % (model, timeout_seconds))
     except urllib.error.URLError as e:
         if isinstance(getattr(e, "reason", None), socket.timeout):
@@ -336,14 +333,37 @@ def _model_request(model, prompt, timeout_seconds=PRIMARY_TIMEOUT):
     return text
 
 
+def _model_request(model, prompt, timeout_seconds):
+    started = time.time()
+    stop = threading.Event()
+
+    print("[Sent] model=%s | timeout=%ss" % (model, timeout_seconds))
+    print("[Thinking] waiting for Gemini...")
+
+    def heartbeat():
+        while not stop.wait(HEARTBEAT_SECONDS):
+            elapsed = int(time.time() - started)
+            print("[Thinking] %s | %ss elapsed" % (model, elapsed))
+
+    thread = threading.Thread(target=heartbeat)
+    thread.daemon = True
+    thread.start()
+
+    try:
+        text = _raw_model_request(model, prompt, timeout_seconds)
+        elapsed = time.time() - started
+        print("[Received] %s | %.1fs" % (model, elapsed))
+        return text
+    finally:
+        stop.set()
+
+
 def available_models():
+    print("[Status] Fetching available Gemini models...")
     url = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000"
     request = urllib.request.Request(
         url,
-        headers={
-            "x-goog-api-key": API_KEY,
-            "User-Agent": "AzzAgent-Gemini/1.3",
-        },
+        headers={"x-goog-api-key": API_KEY, "User-Agent": "AzzAgent-Gemini/1.4"},
         method="GET",
     )
     try:
@@ -386,14 +406,9 @@ def _model_score(name):
 
 def fallback_models(current):
     models = [m for m in available_models() if m != current and _model_score(m) > -100000]
-
-    # Prefer lightweight Flash models during fallback. They are more likely to
-    # answer quickly when the larger Flash endpoints are overloaded/rate-limited.
     def fallback_key(name):
-        low = name.lower()
-        lite_bonus = 100000 if "lite" in low else 0
+        lite_bonus = 100000 if "lite" in name.lower() else 0
         return lite_bonus + _model_score(name)
-
     models.sort(key=fallback_key, reverse=True)
     return models
 
@@ -409,7 +424,7 @@ def call_gemini(prompt):
             return text
         except GeminiTimeoutError as e:
             last_error = e
-            print("\n[Gemini] %s" % e)
+            print("[Timeout] %s" % e)
             break
         except GeminiHTTPError as e:
             last_error = e
@@ -418,15 +433,15 @@ def call_gemini(prompt):
             if e.code not in TRANSIENT_HTTP_CODES:
                 raise
             if attempt < 2:
-                delay = (2, 5)[attempt]
-                print("\n[Gemini] %s unavailable (HTTP %s). Retrying in %ss..." % (MODEL, e.code, delay))
+                delay = (1, 2)[attempt]
+                print("[Retry] %s HTTP %s | waiting %ss" % (MODEL, e.code, delay))
                 time.sleep(delay)
 
-    print("\n[Gemini] Looking for another available Flash model...")
+    print("[Fallback] Looking for another available Flash model...")
     try:
         alternatives = fallback_models(MODEL)
     except Exception as discovery_error:
-        print("[Gemini] Could not list fallback models: %s" % discovery_error)
+        print("[Fallback] Could not list models: %s" % discovery_error)
         if last_error:
             raise last_error
         raise
@@ -437,25 +452,23 @@ def call_gemini(prompt):
         raise RuntimeError("No fallback Flash models available")
 
     for alternative in alternatives[:10]:
-        print("[Gemini] Trying %s (max %ss)..." % (alternative, FALLBACK_TIMEOUT))
+        print("[Fallback] Trying %s" % alternative)
         try:
             text = _model_request(alternative, prompt, FALLBACK_TIMEOUT)
             MODEL = alternative
             save_model(MODEL)
-            print("[Gemini] Switched to %s (saved as default)" % MODEL)
+            print("[Model] Switched to %s and saved as default" % MODEL)
             return text
         except GeminiTimeoutError:
-            print("[Gemini] %s timed out, skipping." % alternative)
-            continue
+            print("[Fallback] %s timed out, skipping" % alternative)
         except GeminiHTTPError as e:
             last_error = e
             if e.code in TRANSIENT_HTTP_CODES or e.code == 404:
-                print("[Gemini] %s unavailable (HTTP %s), skipping." % (alternative, e.code))
+                print("[Fallback] %s HTTP %s, skipping" % (alternative, e.code))
                 continue
             raise
         except RuntimeError as e:
-            print("[Gemini] %s failed: %s" % (alternative, e))
-            continue
+            print("[Fallback] %s failed: %s" % (alternative, e))
 
     if last_error:
         raise last_error
@@ -490,32 +503,45 @@ def build_prompt(user_text):
     return "Project files:\n%s\n\nRecent session:\n%s\n\nUSER: %s" % ("\n".join(top), recent, user_text)
 
 
+def describe_tool(name, args):
+    if name in ("shell", "system_shell"):
+        return "%s: %s" % (name, args.get("command", ""))
+    if "path" in args:
+        return "%s: %s" % (name, args.get("path"))
+    return name
+
+
 def run_turn(user_text):
     HISTORY.append({"role": "user", "text": user_text})
     prompt = build_prompt(user_text)
 
-    for _ in range(MAX_TOOL_STEPS):
-        action = parse_action(call_gemini(prompt))
+    for step in range(1, MAX_TOOL_STEPS + 1):
+        raw = call_gemini(prompt)
+        action = parse_action(raw)
 
         if action.get("type") == "message":
             text = action.get("text", "")
-            print("\nAgent: " + text)
+            print("\n[Reply]")
+            print(text)
             HISTORY.append({"role": "assistant", "text": text})
             return
 
         if action.get("type") != "tool":
-            print("\nAgent error: unknown action: %r" % action)
+            print("[Error] Unknown action: %r" % action)
             return
 
         name = action.get("tool")
         args = action.get("args", {})
-        print("\n[" + str(name) + "]")
+        print("\n[Tool %d/%d] %s" % (step, MAX_TOOL_STEPS, describe_tool(name, args)))
 
         if name not in TOOLS:
             result = "ERROR: unknown tool %s" % name
         else:
             try:
+                started = time.time()
                 result = TOOLS[name](args)
+                if name not in ("shell", "system_shell"):
+                    print("[Done] %s | %.1fs" % (name, time.time() - started))
             except Exception as e:
                 result = "ERROR: %s" % e
 
@@ -523,7 +549,7 @@ def run_turn(user_text):
         HISTORY.append({"role": "tool", "text": result})
         prompt = build_prompt("Continue the task. Latest tool result:\n" + result)
 
-    print("\nStopped after %d tool steps." % MAX_TOOL_STEPS)
+    print("[Stopped] Reached %d tool steps" % MAX_TOOL_STEPS)
 
 
 def show_models():
@@ -544,15 +570,15 @@ def show_models():
 
 def main():
     global MODEL, AUTO_APPROVE, API_KEY
-
     MODEL = load_saved_model()
 
-    print("AzzAgent Gemini 1.3")
+    print("AzzAgent Gemini 1.4")
     print("Project root: %s" % PROJECT_ROOT)
     print("System read: /")
     print("Model: %s" % MODEL)
     print("Project approval default: YES")
-    print("Fallback timeout: %ss per model" % FALLBACK_TIMEOUT)
+    print("System approval default: YES")
+    print("Primary timeout: %ss | fallback: %ss" % (PRIMARY_TIMEOUT, FALLBACK_TIMEOUT))
     print("Commands: /model, /model ID, /yes, /no, /forget-key, /quit")
 
     API_KEY = load_or_create_key()
@@ -569,30 +595,24 @@ def main():
 
         if not user_text:
             continue
-
         if user_text in ("/quit", "/exit", "quit", "exit"):
             break
-
         if user_text in ("/model", "/models"):
             show_models()
             continue
-
         if user_text.startswith("/model "):
             MODEL = user_text.split(None, 1)[1].strip()
             save_model(MODEL)
-            print("Model: %s (saved as default)" % MODEL)
+            print("[Model] %s (saved as default)" % MODEL)
             continue
-
         if user_text == "/yes":
             AUTO_APPROVE = True
-            print("Project auto-approve ON. System actions still require approval.")
+            print("[Approval] Project auto-approve ON. System prompts remain, default YES.")
             continue
-
         if user_text == "/no":
             AUTO_APPROVE = False
-            print("Project auto-approve OFF. Blank approval still means YES.")
+            print("[Approval] Project auto-approve OFF. Project/system blank approval = YES.")
             continue
-
         if user_text == "/forget-key":
             try:
                 KEY_FILE.unlink()
@@ -601,10 +621,11 @@ def main():
                 print("No saved Gemini API key found.")
             continue
 
+        print("[You] %s" % user_text)
         try:
             run_turn(user_text)
         except Exception as e:
-            print("\nERROR: %s" % e)
+            print("[ERROR] %s" % e)
 
     return 0
 
