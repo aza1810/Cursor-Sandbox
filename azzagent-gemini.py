@@ -2,7 +2,7 @@
 """
 AzzAgent Gemini
 Tiny 32-bit-friendly coding agent for Python 3.9.
-Prompts for your Gemini API key each time it starts.
+Prompts for your Gemini API key only on first run, then saves it locally.
 """
 
 import getpass
@@ -21,6 +21,27 @@ MAX_TOOL_STEPS = 12
 MAX_OUTPUT_CHARS = 30000
 HISTORY = []
 API_KEY = None
+KEY_FILE = Path.home() / ".azzagent_gemini_key"
+
+
+def load_or_create_key():
+    if KEY_FILE.exists():
+        key = KEY_FILE.read_text(encoding="utf-8").strip()
+        if key:
+            return key
+
+    key = getpass.getpass("Gemini API key (saved after this): ").strip()
+    if not key:
+        return None
+
+    KEY_FILE.write_text(key + "\n", encoding="utf-8")
+    try:
+        os.chmod(str(KEY_FILE), 0o600)
+    except Exception:
+        pass
+
+    print("API key saved to %s" % KEY_FILE)
+    return key
 
 
 def safe_path(value):
@@ -102,7 +123,15 @@ def shell(args):
     if not approve("RUN: " + command):
         return "DENIED"
     try:
-        result = subprocess.run(command, cwd=str(ROOT), shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, timeout=120)
+        result = subprocess.run(
+            command,
+            cwd=str(ROOT),
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+            timeout=120,
+        )
         return ("exit=%d\n%s" % (result.returncode, result.stdout or ""))[:MAX_OUTPUT_CHARS]
     except subprocess.TimeoutExpired:
         return "ERROR: command timed out after 120 seconds"
@@ -151,7 +180,7 @@ def call_gemini(prompt):
         headers={
             "Content-Type": "application/json",
             "x-goog-api-key": API_KEY,
-            "User-Agent": "AzzAgent-Gemini/0.4",
+            "User-Agent": "AzzAgent-Gemini/0.5",
         },
         method="POST",
     )
@@ -232,14 +261,16 @@ def run_turn(user_text):
 
 def main():
     global MODEL, AUTO_APPROVE, API_KEY
-    print("AzzAgent Gemini 0.4")
+    print("AzzAgent Gemini 0.5")
     print("Project: %s" % ROOT)
     print("Model:   %s" % MODEL)
-    print("Commands: /model ID, /yes, /no, /quit")
-    API_KEY = getpass.getpass("Gemini API key: ").strip()
+    print("Commands: /model ID, /yes, /no, /forget-key, /quit")
+
+    API_KEY = load_or_create_key()
     if not API_KEY:
         print("No Gemini API key supplied.")
         return 1
+
     while True:
         try:
             user_text = input("\nYou> ").strip()
@@ -261,6 +292,13 @@ def main():
         if user_text == "/no":
             AUTO_APPROVE = False
             print("Auto-approve OFF")
+            continue
+        if user_text == "/forget-key":
+            try:
+                KEY_FILE.unlink()
+                print("Saved Gemini API key removed. Restart AzzAgent to enter a new one.")
+            except FileNotFoundError:
+                print("No saved Gemini API key found.")
             continue
         try:
             run_turn(user_text)
