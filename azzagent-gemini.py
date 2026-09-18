@@ -13,7 +13,7 @@ import sys
 import urllib.error
 import urllib.request
 
-MODEL = "gemini-2.5-flash"
+MODEL = "gemini-3.6-flash"
 ROOT = Path.cwd().resolve()
 AUTO_APPROVE = False
 MAX_TOOL_STEPS = 12
@@ -171,7 +171,7 @@ def call_gemini(prompt):
     payload = {
         "systemInstruction": {"parts": [{"text": instructions()}]},
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2},
+        "generationConfig": {"responseMimeType": "application/json"},
     }
     request = urllib.request.Request(
         url,
@@ -179,7 +179,7 @@ def call_gemini(prompt):
         headers={
             "Content-Type": "application/json",
             "x-goog-api-key": API_KEY,
-            "User-Agent": "AzzAgent-Gemini/0.6",
+            "User-Agent": "AzzAgent-Gemini/0.7",
         },
         method="POST",
     )
@@ -260,7 +260,7 @@ def run_turn(user_text):
 
 def main():
     global MODEL, AUTO_APPROVE, API_KEY
-    print("AzzAgent Gemini 0.6")
+    print("AzzAgent Gemini 0.7")
     print("Project: %s" % ROOT)
     print("Model:   %s" % MODEL)
     print("Commands: /model ID, /yes, /no, /forget-key, /quit")
