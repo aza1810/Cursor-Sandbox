@@ -1,6 +1,6 @@
 #!/usr/local/bin/python3.9
 """
-AzzAgent Gemini 0.9
+AzzAgent Gemini 1.0
 32-bit-friendly coding/system agent for Python 3.9.
 
 - Reads may inspect the whole Linux filesystem.
@@ -10,6 +10,8 @@ AzzAgent Gemini 0.9
 - Gemini 429/5xx errors are retried automatically.
 - If the selected Gemini model stays unavailable, AzzAgent discovers another
   available Flash model from the API and continues automatically.
+- /model lists every generateContent model available to the current API key.
+- /model MODEL_ID switches model; /models is kept as an alias.
 """
 
 import json
@@ -253,7 +255,7 @@ def _model_request(model, prompt):
         url,
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json", "x-goog-api-key": API_KEY,
-                 "User-Agent": "AzzAgent-Gemini/0.9"},
+                 "User-Agent": "AzzAgent-Gemini/1.0"},
         method="POST",
     )
     try:
@@ -278,7 +280,7 @@ def available_models():
     url = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000"
     request = urllib.request.Request(
         url,
-        headers={"x-goog-api-key": API_KEY, "User-Agent": "AzzAgent-Gemini/0.9"},
+        headers={"x-goog-api-key": API_KEY, "User-Agent": "AzzAgent-Gemini/1.0"},
         method="GET",
     )
     try:
@@ -292,15 +294,14 @@ def available_models():
 
     result = []
     for item in data.get("models", []):
-        methods = item.get("supportedGenerationMethods", [])
-        if "generateContent" not in methods:
+        if "generateContent" not in item.get("supportedGenerationMethods", []):
             continue
         name = item.get("name", "")
         if name.startswith("models/"):
             name = name[7:]
         if name:
             result.append(name)
-    return result
+    return sorted(set(result), key=lambda s: s.lower())
 
 
 def _model_score(name):
@@ -314,17 +315,14 @@ def _model_score(name):
         score += 10000
     match = re.search(r"gemini-(\d+)(?:\.(\d+))?", low)
     if match:
-        major = int(match.group(1))
-        minor = int(match.group(2) or 0)
-        score += major * 1000 + minor * 100
+        score += int(match.group(1)) * 1000 + int(match.group(2) or 0) * 100
     if "lite" in low:
         score -= 50
     return score
 
 
 def fallback_models(current):
-    models = available_models()
-    models = [m for m in models if m != current and _model_score(m) > -100000]
+    models = [m for m in available_models() if m != current and _model_score(m) > -100000]
     models.sort(key=_model_score, reverse=True)
     return models
 
@@ -332,7 +330,6 @@ def fallback_models(current):
 def call_gemini(prompt):
     global MODEL
     last_error = None
-
     for attempt in range(3):
         try:
             return _model_request(MODEL, prompt)
@@ -354,7 +351,6 @@ def call_gemini(prompt):
         except Exception as discovery_error:
             print("[Gemini] Could not list fallback models: %s" % discovery_error)
             raise last_error
-
         for alternative in alternatives[:8]:
             print("[Gemini] Trying %s..." % alternative)
             try:
@@ -369,7 +365,6 @@ def call_gemini(prompt):
                 raise
             except RuntimeError:
                 continue
-
     if last_error:
         raise last_error
     raise RuntimeError("Gemini request failed")
@@ -438,24 +433,23 @@ def show_models():
     except Exception as e:
         print("Could not list models: %s" % e)
         return
-    flash = [m for m in models if _model_score(m) > -100000]
-    flash.sort(key=_model_score, reverse=True)
-    if not flash:
-        print("No generateContent Flash models returned for this API key.")
+    if not models:
+        print("No generateContent models returned for this API key.")
         return
-    print("Available Flash models:")
-    for name in flash:
-        marker = " *" if name == MODEL else ""
+    print("Available models (%d):" % len(models))
+    for name in models:
+        marker = "  < current" if name == MODEL else ""
         print("  %s%s" % (name, marker))
+    print("\nSwitch with: /model MODEL_ID")
 
 
 def main():
     global MODEL, AUTO_APPROVE, API_KEY
-    print("AzzAgent Gemini 0.9")
+    print("AzzAgent Gemini 1.0")
     print("Project root: %s" % PROJECT_ROOT)
     print("System read: /")
     print("Model: %s" % MODEL)
-    print("Commands: /model ID, /models, /yes, /no, /forget-key, /quit")
+    print("Commands: /model, /model ID, /yes, /no, /forget-key, /quit")
     API_KEY = load_or_create_key()
     if not API_KEY:
         print("No Gemini API key supplied.")
@@ -470,12 +464,12 @@ def main():
             continue
         if user_text in ("/quit", "/exit", "quit", "exit"):
             break
+        if user_text in ("/model", "/models"):
+            show_models()
+            continue
         if user_text.startswith("/model "):
             MODEL = user_text.split(None, 1)[1].strip()
             print("Model: " + MODEL)
-            continue
-        if user_text == "/models":
-            show_models()
             continue
         if user_text == "/yes":
             AUTO_APPROVE = True
